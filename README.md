@@ -15,20 +15,7 @@
 
 悬浮窗右上角常驻,自动跟随 zcode 的模型请求刷新,无需任何手动操作:
 
-```text
-⚡ ZCode TPS  14:02:31
-────────────────────────────────────────────────────
-TPS avg of last 10 (tok/s excl. TTFT)
- open.bigmodel.cn/api/anthropic
-   GLM-5.3-Flash
-     avg   63.9 tok/s   TTFT  3.9s
-     last  46.9 tok/s   TTFT  3.6s
-────────────────────────────────────────────────────
-Recent requests (10/10)
-  time      model            dur  tok/s  TTFT
-✓ 14:02:27  GLM-5.3-Flash   40.7  100.3   4.8
-● 14:02:31  GLM-5.3-Flash    2.3     --    --
-```
+![悬浮窗效果](docs/overlay-preview.png)
 
 | 区域/字段 | 含义 |
 |---|---|
