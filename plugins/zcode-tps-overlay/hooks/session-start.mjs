@@ -26,8 +26,9 @@ function overlayAlive() {
   try {
     const pid = parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
     if (!pid) return false;
-    const r = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/NH"], { encoding: "utf8" });
-    return (r.stdout || "").includes(String(pid));
+    // require the pid to actually be a pythonw.exe process (guards against pid reuse)
+    const r = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], { encoding: "utf8" });
+    return (r.stdout || "").includes('"pythonw.exe"');
   } catch {
     return false;
   }

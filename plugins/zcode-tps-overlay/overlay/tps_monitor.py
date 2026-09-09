@@ -9,9 +9,10 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 
-from tps_core import (ACTIVE_TTL, Store, clear_pid, config_mtime, load_config,
-                      poll_db, short_base, tail_daily, write_pid)
+from tps_core import (ACTIVE_TTL, Store, ZCODE_DIR, clear_pid, config_mtime,
+                      load_config, poll_db, short_base, tail_daily, write_pid)
 
 REFRESH_MS = 500
 SNAP = 24              # release within this distance of a screen edge docks
@@ -59,6 +60,25 @@ def rjust_w(s, w):
     return " " * max(0, w - disp_w(s)) + s
 
 
+def log_line(msg):
+    """Append a timestamped line to ~/.zcode/tps.log (crash/event record)."""
+    try:
+        with open(ZCODE_DIR / "tps.log", "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def install_exception_logging():
+    """Log any unhandled exception so a silent pythonw exit leaves evidence."""
+    def sys_hook(etype, value, tb):
+        log_line("FATAL unhandled exception:\n" + "".join(traceback.format_exception(etype, value, tb)).rstrip())
+    def thread_hook(args):
+        log_line("FATAL thread exception:\n" + "".join(traceback.format_exception(*args.exc_info)).rstrip())
+    sys.excepthook = sys_hook
+    threading.excepthook = thread_hook
+
+
 class Overlay(tk.Tk):
     def __init__(self, store):
         super().__init__()
@@ -93,6 +113,7 @@ class Overlay(tk.Tk):
         self.after(150, self._tick_dock)
 
     def destroy(self):
+        log_line("overlay exit")
         clear_pid()
         super().destroy()
 
@@ -163,14 +184,18 @@ class Overlay(tk.Tk):
         state = {"i": 0}
 
         def step():
-            state["i"] += 1
-            if state["i"] >= n:
-                self.geometry(f"+{tx}+{ty}")
+            try:
+                state["i"] += 1
+                if state["i"] >= n:
+                    self.geometry(f"+{tx}+{ty}")
+                    self._anim_id = None
+                    return
+                k = 1 - (1 - state["i"] / n) ** 3  # ease-out
+                self.geometry(f"+{round(sx + (tx - sx) * k)}+{round(sy + (ty - sy) * k)}")
+                self._anim_id = self.after(16, step)
+            except Exception:
+                log_line("slide error:\n" + traceback.format_exc().rstrip())
                 self._anim_id = None
-                return
-            k = 1 - (1 - state["i"] / n) ** 3  # ease-out
-            self.geometry(f"+{round(sx + (tx - sx) * k)}+{round(sy + (ty - sy) * k)}")
-            self._anim_id = self.after(16, step)
 
         step()
 
@@ -205,20 +230,23 @@ class Overlay(tk.Tk):
             self._slide(self.winfo_screenwidth() - self.winfo_width(), y)
 
     def _tick_dock(self):
-        # stay idle while animating to avoid mid-flight reversals; judge after
-        if self.dock and self.drag is None and self._anim_id is None:
-            in_zone = self._pointer_in_zone()
-            if in_zone and not self.shown:
-                self._miss = 0
-                self._reveal()
-            elif not in_zone and self.shown:
-                self._miss += 1  # hide only after 2 consecutive out-of-zone reads
-                if self._miss >= 2:
+        self.after(150, self._tick_dock)  # schedule first: errors must not kill the loop
+        try:
+            # stay idle while animating to avoid mid-flight reversals; judge after
+            if self.dock and self.drag is None and self._anim_id is None:
+                in_zone = self._pointer_in_zone()
+                if in_zone and not self.shown:
                     self._miss = 0
-                    self._hide()
-            else:
-                self._miss = 0
-        self.after(150, self._tick_dock)
+                    self._reveal()
+                elif not in_zone and self.shown:
+                    self._miss += 1  # hide only after 2 consecutive out-of-zone reads
+                    if self._miss >= 2:
+                        self._miss = 0
+                        self._hide()
+                else:
+                    self._miss = 0
+        except Exception:
+            log_line("dock tick error:\n" + traceback.format_exc().rstrip())
 
     def _popup(self, e):
         try:
@@ -227,7 +255,22 @@ class Overlay(tk.Tk):
             self.menu.grab_release()
 
     def render(self):
+        self.after(REFRESH_MS, self.render)  # schedule first: errors must not kill the loop
+        try:
+            self._render_once()
+        except Exception:
+            log_line("render error:\n" + traceback.format_exc().rstrip())
+
+    def _render_once(self):
         now = time.time()
+        # pull back into the screen if the window ended up fully outside it
+        # (e.g. monitor resolution change); docked windows are exempt
+        if self.dock is None and self.drag is None:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            x, y = self.winfo_x(), self.winfo_y()
+            w, h = self.winfo_width(), self.winfo_height()
+            if x + w <= 0 or x >= sw or y + h <= 0 or y >= sh:
+                self.geometry(f"+{max(0, sw - w - 40)}+80")
         # hot-reload UI language from ~/.zcode/tps.json
         mtime = config_mtime()
         if mtime != self._cfg_mtime:
@@ -299,11 +342,12 @@ class Overlay(tk.Tk):
             lbl.config(text=text, fg=color)
         for lbl in self.labels[len(lines):]:
             lbl.pack_forget()
-        self.after(REFRESH_MS, self.render)
 
 
 def main():
+    install_exception_logging()
     write_pid(os.getpid())
+    log_line(f"overlay start pid={os.getpid()} lang={load_config().get('language', 'en')}")
     store = Store()
     threading.Thread(target=tail_daily, args=(store,), daemon=True).start()
     threading.Thread(target=poll_db, args=(store,), daemon=True).start()
