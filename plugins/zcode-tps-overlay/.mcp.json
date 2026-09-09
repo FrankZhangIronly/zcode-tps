@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "zcode-tps-overlay": {
+      "type": "stdio",
+      "command": "D:/miniconda3/envs/bonc/python.exe",
+      "args": [
+        "${ZCODE_PLUGIN_ROOT}/mcp/tps_server.py"
+      ],
+      "enabled": true,
+      "timeoutMs": 30000
+    }
+  }
+}

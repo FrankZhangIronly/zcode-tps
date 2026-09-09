@@ -1,0 +1,25 @@
+{
+  "name": "zcode-tps",
+  "description": "Open-source ZCode plugins: TPS/TTFT floating-window monitor (zcode-tps-overlay).",
+  "owner": {
+    "name": "FrankZhangIronly"
+  },
+  "plugins": [
+    {
+      "name": "zcode-tps-overlay",
+      "source": "./plugins/zcode-tps-overlay",
+      "description": "TPS floating-window monitor with MCP tools: start/stop/status, UI language, session TTFT & token-speed stats.",
+      "version": "0.1.0",
+      "author": {
+        "name": "FrankZhangIronly"
+      },
+      "category": "monitoring",
+      "keywords": [
+        "tps",
+        "ttft",
+        "monitor",
+        "overlay"
+      ]
+    }
+  ]
+}
