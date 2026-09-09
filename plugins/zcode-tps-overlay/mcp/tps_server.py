@@ -231,10 +231,12 @@ HANDLERS = {
 
 
 def write_message(message):
-    body = json.dumps(message, ensure_ascii=False)
-    # MCP stdio framing: Content-Length header + body (also tolerated bare by some clients)
-    sys.stdout.write(f"Content-Length: {len(body.encode('utf-8'))}\r\n\r\n{body}")
-    sys.stdout.flush()
+    body = json.dumps(message, ensure_ascii=False).encode("utf-8")
+    # MCP stdio framing. Written as raw bytes: text-mode stdout translates "\n"
+    # into "\r\n" on Windows, corrupting the header into "\r\r\n" and hanging
+    # strict parsers until timeout.
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
 
 
 def handle_request(msg):

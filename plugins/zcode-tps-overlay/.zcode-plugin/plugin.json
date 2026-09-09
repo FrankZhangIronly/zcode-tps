@@ -1,6 +1,6 @@
 {
   "name": "zcode-tps-overlay",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TPS floating-window monitor for ZCode: an always-on-top overlay showing per (baseURL, model) token speed (TTFT excluded) and TTFT, with MCP tools for the model to start/stop it, switch UI language, and query session stats.",
   "author": {
     "name": "frank"
