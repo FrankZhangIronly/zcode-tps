@@ -11,8 +11,9 @@ import time
 import tkinter as tk
 import traceback
 
-from tps_core import (ACTIVE_TTL, Store, ZCODE_DIR, clear_pid, config_mtime,
-                      load_config, poll_db, short_base, tail_daily, write_pid)
+from tps_core import (ACTIVE_TTL, PID_PATH, Store, ZCODE_DIR, clear_pid,
+                      config_mtime, load_config, poll_db, short_base,
+                      tail_daily, write_pid)
 
 REFRESH_MS = 500
 SNAP = 24              # release within this distance of a screen edge docks
@@ -114,7 +115,11 @@ class Overlay(tk.Tk):
 
     def destroy(self):
         log_line("overlay exit")
-        clear_pid()
+        try:  # clear the pid file only if it is ours
+            if int(PID_PATH.read_text(encoding="utf-8").strip()) == os.getpid():
+                clear_pid()
+        except (OSError, ValueError):
+            pass
         super().destroy()
 
     def _press(self, e):
@@ -283,6 +288,7 @@ class Overlay(tk.Tk):
 
         with self.store.lock:
             history = {k: list(v) for k, v in self.store.history.items()}
+            model_last = dict(self.store.model_last)
             for rec in self.store.records:  # close records stuck past TTL (e.g. killed)
                 if rec["end"] is None and now - rec["start"] > ACTIVE_TTL:
                     rec["end"] = now
@@ -294,17 +300,24 @@ class Overlay(tk.Tk):
         lines.append(("─" * 56, DIM))
         lines.append((T["avg_hdr"], DIM))
         if history:
-            for (base, model), vals in sorted(history.items()):
-                avg = sum(v[0] for v in vals) / len(vals)
-                ttfts = [v[1] for v in vals if v[1] is not None]
-                avg_tt = f"{sum(ttfts) / len(ttfts):4.1f}s" if ttfts else "  --"
-                last_tps, last_tt = vals[-1]
-                last_tt = f"{last_tt:4.1f}s" if last_tt is not None else "  --"
+            base_models = {}
+            for base, model in history:
+                base_models.setdefault(base, []).append(model)
+            for base in sorted(base_models):
                 lines.append((f" {short_base(base)}", BLUE))
-                lines.append((f"   {model}", FG))
-                lines.append((f"     {T['avg']} {avg:6.1f} tok/s   TTFT {avg_tt}", GREEN))
-                lines.append((f"     {T['last']} {last_tps:6.1f} tok/s   TTFT {last_tt}",
-                              GREEN))
+                models = base_models[base]
+                models.sort(key=lambda m: model_last.get((base, m), 0.0), reverse=True)
+                for model in models[:2]:  # keep at most the two most recent models per base
+                    vals = history[(base, model)]
+                    avg = sum(v[0] for v in vals) / len(vals)
+                    ttfts = [v[1] for v in vals if v[1] is not None]
+                    avg_tt = f"{sum(ttfts) / len(ttfts):4.1f}s" if ttfts else "  --"
+                    last_tps, last_tt = vals[-1]
+                    last_tt = f"{last_tt:4.1f}s" if last_tt is not None else "  --"
+                    lines.append((f"   {model}", FG))
+                    lines.append((f"     {T['avg']} {avg:6.1f} tok/s   TTFT {avg_tt}", GREEN))
+                    lines.append((f"     {T['last']} {last_tps:6.1f} tok/s   TTFT {last_tt}",
+                                  GREEN))
         else:
             lines.append((T["no_data"], DIM))
         lines.append(("─" * 56, DIM))

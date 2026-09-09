@@ -116,6 +116,7 @@ class Store:
         self.pending = {}                # traceId -> [record, ...] not completed yet
         self.session_model = {}  # sessionId -> last completed modelId (in-flight row label)
         self.history = {}        # (baseURL, modelId) -> deque(maxlen=10) of (tok/s, TTFT s|None)
+        self.model_last = {}     # (baseURL, modelId) -> start epoch of its latest request
         self.provider_base = {}  # providerId -> baseURL (from v2/config.json, refreshed on demand)
         self._cfg_mtime = 0.0
 
@@ -207,15 +208,16 @@ def handle_db_row(store, r, seed=False):
         span = (dur_ms - ttft) if ttft_s is not None else dur_ms  # exclude TTFT
         tps = out * 1000.0 / span
     base = store.base_of(r["provider_id"])  # locks internally; call before taking lock
+    start_ms = r["started_at"]
+    start = start_ms / 1000.0 if isinstance(start_ms, (int, float)) else time.time()
     if r["session_id"]:
         with store.lock:
             store.session_model[r["session_id"]] = model_id
     if tps is not None and (r["status"] or "") == "completed":
         with store.lock:
-            store.history.setdefault(
-                (base, model_id), deque(maxlen=10)).append((tps, ttft_s))
-    start_ms = r["started_at"]
-    start = start_ms / 1000.0 if isinstance(start_ms, (int, float)) else time.time()
+            key = (base, model_id)
+            store.history.setdefault(key, deque(maxlen=10)).append((tps, ttft_s))
+            store.model_last[key] = start  # recency used by the UI's per-base cap
     with store.lock:
         rec = _take_pending(store, r["trace_id"], start)
         if rec is None:
