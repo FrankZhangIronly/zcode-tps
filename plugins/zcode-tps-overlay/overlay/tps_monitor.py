@@ -17,8 +17,7 @@ from tps_core import (ACTIVE_TTL, PID_PATH, Store, ZCODE_DIR, clear_pid,
 
 REFRESH_MS = 500
 SNAP = 24              # release within this distance of a screen edge docks
-STRIP = 4              # strip (px) left visible while dock-hidden
-HOVER_IN = 16          # hover trigger depth inward from the edge (px)
+HIDE_BAND = 20         # px left visible while dock-hidden; equals the hover trigger depth
 EDGE_OUT = 8           # outward (off-screen) extension of the shown-window zone
 
 BG, FG = "#1e1e2e", "#cdd6f4"
@@ -149,22 +148,23 @@ class Overlay(tk.Tk):
             self.dock = None
 
     def _pointer_in_zone(self):
-        """Hover zone. Hidden: a band HOVER_IN deep inward from the docked edge
-        (no need to hit the few-pixel strip). Shown: the window rect, extended
-        only outward (off-screen) so an edge-hugging pointer stays inside."""
+        """Hover zone. Hidden: the visible band (HIDE_BAND deep inward from the
+        docked edge) is also the trigger area, so what you see is what hovers.
+        Shown: the window rect, extended only outward (off-screen) so an
+        edge-hugging pointer stays inside."""
         px, py = self.winfo_pointerx(), self.winfo_pointery()
         wx, wy = self.winfo_rootx(), self.winfo_rooty()
         w, h = self.winfo_width(), self.winfo_height()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         if not self.shown:
             if self.dock == "top":
-                return py < STRIP + HOVER_IN and wx <= px < wx + w
+                return py < HIDE_BAND and wx <= px < wx + w
             if self.dock == "bottom":
-                return py > sh - STRIP - HOVER_IN and wx <= px < wx + w
+                return py > sh - HIDE_BAND and wx <= px < wx + w
             if self.dock == "left":
-                return px < STRIP + HOVER_IN and wy <= py < wy + h
+                return px < HIDE_BAND and wy <= py < wy + h
             if self.dock == "right":
-                return px > sw - STRIP - HOVER_IN and wy <= py < wy + h
+                return px > sw - HIDE_BAND and wy <= py < wy + h
             return False
         if self.dock == "top":
             return wx <= px < wx + w and wy - EDGE_OUT <= py < wy + h
@@ -212,13 +212,13 @@ class Overlay(tk.Tk):
         ry = min(max(y, 0), sh - h)
         self.shown = False
         if self.dock == "top":
-            self._slide(rx, -h + STRIP)
+            self._slide(rx, -h + HIDE_BAND)
         elif self.dock == "bottom":
-            self._slide(rx, sh - STRIP)
+            self._slide(rx, sh - HIDE_BAND)
         elif self.dock == "left":
-            self._slide(-w + STRIP, ry)
+            self._slide(-w + HIDE_BAND, ry)
         elif self.dock == "right":
-            self._slide(sw - STRIP, ry)
+            self._slide(sw - HIDE_BAND, ry)
 
     def _reveal(self):
         # Reveal flush with the docked edge so the hovering pointer stays inside
