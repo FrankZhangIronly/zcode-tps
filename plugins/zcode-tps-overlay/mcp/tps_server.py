@@ -231,11 +231,13 @@ HANDLERS = {
 
 
 def write_message(message):
+    # MCP stdio framing: NEWLINE-DELIMITED JSON - one message per line, no
+    # embedded newlines, terminated by "\n". Raw bytes via stdout.buffer so
+    # Windows text mode does not translate the trailing newline. (LSP-style
+    # "Content-Length" framing is NOT part of the MCP stdio protocol and hangs
+    # the client: its parser splits on "\n" and JSON.parse-es each line.)
     body = json.dumps(message, ensure_ascii=False).encode("utf-8")
-    # MCP stdio framing. Written as raw bytes: text-mode stdout translates "\n"
-    # into "\r\n" on Windows, corrupting the header into "\r\r\n" and hanging
-    # strict parsers until timeout.
-    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.write(body + b"\n")
     sys.stdout.buffer.flush()
 
 
