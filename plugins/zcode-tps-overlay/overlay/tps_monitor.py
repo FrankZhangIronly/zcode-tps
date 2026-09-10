@@ -9,15 +9,18 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import traceback
 
 from tps_core import (ACTIVE_TTL, PID_PATH, Store, ZCODE_DIR, clear_pid,
                       config_mtime, load_config, poll_db, short_base,
                       tail_daily, write_pid)
 
+FONT = ("Consolas", 9)
 REFRESH_MS = 500
 SNAP = 24              # release within this distance of a screen edge docks
 HIDE_BAND = 20         # px left visible while dock-hidden; equals the hover trigger depth
+TOP_BAND_ROWS = 2      # text rows kept visible when collapsed toward the top edge
 EDGE_OUT = 8           # outward (off-screen) extension of the shown-window zone
 
 BG, FG = "#1e1e2e", "#cdd6f4"
@@ -108,6 +111,16 @@ class Overlay(tk.Tk):
         self.menu.add_command(label="Exit", command=self.destroy)
         self.frame = tk.Frame(self, bg=BG)
         self.frame.pack(fill="both", expand=True)
+        # The top strip is measured from a real label rather than the font's
+        # linespace: a packed row is taller than its glyphs (border + pady), so
+        # linespace alone would leave the second row cut off. Measuring keeps the
+        # collapsed window showing exactly the newest rows (the in-flight request
+        # and the most recently completed one) at any DPI.
+        probe = tk.Label(self.frame, bg=BG, anchor="w", font=FONT)
+        row_h = probe.winfo_reqheight() or tkfont.Font(root=self, family=FONT[0],
+                                                      size=FONT[1]).metrics("linespace")
+        probe.destroy()
+        self.top_band = row_h * TOP_BAND_ROWS
         self.labels = []  # fixed label pool: update text/color only, no rebuild flicker
         self.after(200, self.render)
         self.after(150, self._tick_dock)
@@ -147,18 +160,23 @@ class Overlay(tk.Tk):
         else:
             self.dock = None
 
+    def _band(self, edge):
+        """Visible strip along a docked edge, which is also the hover depth.
+        The top edge keeps the trailing data rows in view while collapsed."""
+        return self.top_band if edge == "top" else HIDE_BAND
+
     def _pointer_in_zone(self):
-        """Hover zone. Hidden: the visible band (HIDE_BAND deep inward from the
-        docked edge) is also the trigger area, so what you see is what hovers.
-        Shown: the window rect, extended only outward (off-screen) so an
-        edge-hugging pointer stays inside."""
+        """Hover zone. Hidden: the visible band (as deep inward from the docked
+        edge as the strip that stays on screen) is also the trigger area, so what
+        you see is what hovers. Shown: the window rect, extended only outward
+        (off-screen) so an edge-hugging pointer stays inside."""
         px, py = self.winfo_pointerx(), self.winfo_pointery()
         wx, wy = self.winfo_rootx(), self.winfo_rooty()
         w, h = self.winfo_width(), self.winfo_height()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         if not self.shown:
             if self.dock == "top":
-                return py < HIDE_BAND and wx <= px < wx + w
+                return py < self._band("top") and wx <= px < wx + w
             if self.dock == "bottom":
                 return py > sh - HIDE_BAND and wx <= px < wx + w
             if self.dock == "left":
@@ -212,7 +230,7 @@ class Overlay(tk.Tk):
         ry = min(max(y, 0), sh - h)
         self.shown = False
         if self.dock == "top":
-            self._slide(rx, -h + HIDE_BAND)
+            self._slide(rx, -h + self._band("top"))
         elif self.dock == "bottom":
             self._slide(rx, sh - HIDE_BAND)
         elif self.dock == "left":
@@ -348,7 +366,7 @@ class Overlay(tk.Tk):
         sep = "─" * (max_w + 2)
         lines = [(sep if t.startswith("─") else t, c) for t, c in lines]
         while len(self.labels) < len(lines):
-            lbl = tk.Label(self.frame, bg=BG, anchor="w", font=("Consolas", 9))
+            lbl = tk.Label(self.frame, bg=BG, anchor="w", font=FONT)
             lbl.pack(fill="x")
             self.labels.append(lbl)
         for lbl, (text, color) in zip(self.labels, lines):

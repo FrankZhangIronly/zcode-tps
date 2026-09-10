@@ -9,7 +9,7 @@
       "name": "zcode-tps-overlay",
       "source": "./plugins/zcode-tps-overlay",
       "description": "TPS floating-window monitor with MCP tools: start/stop/status, UI language, session TTFT & token-speed stats.",
-      "version": "0.1.5",
+      "version": "0.2.0",
       "author": {
         "name": "FrankZhangIronly"
       },

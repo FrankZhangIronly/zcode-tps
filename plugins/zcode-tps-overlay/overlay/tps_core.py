@@ -9,7 +9,9 @@ Stdlib only.
 """
 
 import json
+import os
 import sqlite3
+import sys
 import threading
 import time
 from collections import deque
@@ -66,15 +68,25 @@ def read_state_session():
 def pid_alive(pid):
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        except (OSError, ValueError, AttributeError):
+            return False
+        if not h:
+            return False
+        k.CloseHandle(h)
+        return True
     try:
-        import ctypes
-        k = ctypes.windll.kernel32
-        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    except (OSError, ValueError):
+        os.kill(pid, 0)  # signal 0 only performs the permission/existence check
+    except ProcessLookupError:
         return False
-    if not h:
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
         return False
-    k.CloseHandle(h)
     return True
 
 

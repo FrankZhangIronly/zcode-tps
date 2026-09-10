@@ -1,0 +1,16 @@
+{
+  "name": "zcode-tps",
+  "version": "0.2.0",
+  "private": true,
+  "description": "ZCode TPS/TTFT floating-window monitor plugin (marketplace zcode-tps)",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test",
+    "setup": "node plugins/zcode-tps-overlay/skills/tps-setup/setup.mjs --start",
+    "start": "node start.mjs",
+    "stop": "node start.mjs --stop"
+  }
+}

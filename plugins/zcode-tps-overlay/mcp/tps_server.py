@@ -15,6 +15,8 @@ Manual smoke test:
 """
 
 import json
+import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -98,18 +100,33 @@ def _overlay_path():
     return Path(__file__).resolve().parent.parent / "overlay" / "tps_monitor.py"
 
 
-def _pythonw():
+def _windowless():
+    """Interpreter for the GUI: this same interpreter, but under Windows prefer
+    the console-less pythonw.exe next to it when present. mcp/launch.mjs picked
+    this interpreter at runtime, so nothing here is host-specific."""
     exe = Path(sys.executable)
-    pw = exe.with_name("pythonw.exe")
-    return pw if pw.exists() else exe
+    if sys.platform == "win32":
+        pw = exe.with_name("pythonw.exe")
+        if pw.exists():
+            return pw
+    return exe
+
+
+def _spawn_kwargs():
+    """Detach the overlay so it outlives this MCP server on every platform."""
+    if sys.platform == "win32":
+        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        if _windowless().name.lower() != "pythonw.exe":
+            flags |= 0x08000000  # CREATE_NO_WINDOW: no console for python.exe
+        return {"creationflags": flags}
+    return {"start_new_session": True}
 
 
 def tps_start(args):
     pid = core.read_pid()
     if pid:
         return f"Overlay already running (pid {pid})."
-    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen([str(_pythonw()), str(_overlay_path())], creationflags=flags,
+    subprocess.Popen([str(_windowless()), str(_overlay_path())], **_spawn_kwargs(),
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
     time.sleep(1.0)
     pid = core.read_pid()
@@ -122,12 +139,20 @@ def tps_stop(args):
     pid = core.read_pid()
     if not pid:
         return "Overlay is not running."
-    r = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True,
-                       text=True, encoding="utf-8", errors="replace")
+    if sys.platform == "win32":
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace")
+        ok, detail = r.returncode == 0, (r.stderr or r.stdout).strip()
+    else:
+        ok, detail = True, ""
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as err:
+            ok, detail = False, str(err)
     core.clear_pid()
-    if r.returncode == 0:
+    if ok:
         return f"Overlay stopped (pid {pid})."
-    return f"Failed to stop pid {pid}: {(r.stderr or r.stdout).strip()}"
+    return f"Failed to stop pid {pid}: {detail}"
 
 
 def _snapshot_lines():
