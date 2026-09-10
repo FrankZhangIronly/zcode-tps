@@ -4,6 +4,8 @@ Data sources:
 - ~/.zcode/cli/log/zcode-YYYY-MM-DD.jsonl      request-started events (in-flight rows)
 - model_usage table in ~/.zcode/cli/db/db.sqlite  real tokens, duration and
   time_to_first_token_ms (TTFT); read via read-only WAL, safe while zcode runs
+- api.commandcode.ai/alpha (undocumented; the same read-only GETs the official
+  CLI and web app use) — Command Code 5h/week/month quota meters
 
 Stdlib only.
 """
@@ -14,6 +16,8 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +34,12 @@ PID_PATH = ZCODE_DIR / "tps.pid"             # overlay process id
 SEED_WINDOW_MS = 6 * 3600 * 1000             # DB polling lookback window
 ACTIVE_TTL = 15 * 60   # record timeout (crash-leftover guard)
 PAIR_TOL = 5  # s; a started event pairs with a model_usage row within this start-time tolerance
+
+CC_API = "https://api.commandcode.ai/alpha"  # Command Code quota meters (read-only)
+CC_USER_AGENT = "zcode-tps-overlay"  # Cloudflare error 1010 rejects Python's default UA
+USAGE_POLL_S = 60      # quota refresh interval
+USAGE_STALE_S = 300    # drop the meters once refreshing has failed this long
+USAGE_TIMEOUT = 8      # s per request
 
 DEFAULT_CONFIG = {"language": "en", "autostart": True}
 
@@ -130,6 +140,7 @@ class Store:
         self.history = {}        # (baseURL, modelId) -> deque(maxlen=10) of (tok/s, TTFT s|None)
         self.model_last = {}     # (baseURL, modelId) -> start epoch of its latest request
         self.provider_base = {}  # providerId -> baseURL (from v2/config.json, refreshed on demand)
+        self.usage = None        # Command Code quota meters (see poll_usage)
         self._cfg_mtime = 0.0
 
     def base_of(self, provider_id):
@@ -183,7 +194,7 @@ def handle_daily_event(store, d):
     ev, trace = d.get("event"), d.get("traceId")
     if ev == "model.request.started" and trace:
         rec = {"start": iso_to_epoch(d.get("timestamp")), "end": None, "dur": None,
-               "tps": None, "ttft": None, "failed": False,
+               "tps": None, "ttft": None, "failed": False, "approx": False,
                "model": store.session_model.get(d.get("sessionId"), "…")}
         with store.lock:
             store.records.append(rec)
@@ -215,9 +226,15 @@ def handle_db_row(store, r, seed=False):
     ttft = r["time_to_first_token_ms"]
     ttft_s = ttft / 1000.0 if isinstance(ttft, (int, float)) and 0 <= ttft < dur_ms else None
     out = r["output_tokens"]
+    # Streaming speed is output over generation time, i.e. the wait for the first
+    # token is excluded. A response carrying only tool calls gets no first-token
+    # timestamp, so that wait is unknown for it: such a row can only be timed from
+    # end to end. Flag it so the UI can mark it and keep it out of the averages,
+    # rather than silently blending two different measurements into one column.
+    approx = ttft_s is None
     tps = None
     if isinstance(out, (int, float)) and out > 0:
-        span = (dur_ms - ttft) if ttft_s is not None else dur_ms  # exclude TTFT
+        span = dur_ms if approx else (dur_ms - ttft)
         tps = out * 1000.0 / span
     base = store.base_of(r["provider_id"])  # locks internally; call before taking lock
     start_ms = r["started_at"]
@@ -228,7 +245,8 @@ def handle_db_row(store, r, seed=False):
     if tps is not None and (r["status"] or "") == "completed":
         with store.lock:
             key = (base, model_id)
-            store.history.setdefault(key, deque(maxlen=10)).append((tps, ttft_s))
+            if not approx:  # only like-for-like numbers may feed the average
+                store.history.setdefault(key, deque(maxlen=10)).append((tps, ttft_s))
             store.model_last[key] = start  # recency used by the UI's per-base cap
     with store.lock:
         rec = _take_pending(store, r["trace_id"], start)
@@ -237,13 +255,14 @@ def handle_db_row(store, r, seed=False):
                 return
             # no started event (e.g. title-gen sub-requests): append a completed record
             rec = {"start": start, "end": None, "dur": None, "tps": None,
-                   "ttft": None, "failed": False, "model": model_id}
+                   "ttft": None, "failed": False, "model": model_id, "approx": False}
             store.records.append(rec)
         rec["model"] = model_id
         rec["dur"] = dur_ms / 1000.0
         rec["end"] = start + rec["dur"]
         rec["tps"] = tps
         rec["ttft"] = ttft_s
+        rec["approx"] = approx
         rec["failed"] = (r["status"] or "") != "completed"
 
 
@@ -319,6 +338,125 @@ def poll_db(store):
         for r in (fresh[-10:] if first else fresh):
             handle_db_row(store, r)
         time.sleep(1.5)
+
+
+def _isnum(v):
+    """True for real JSON numbers (Python bools are ints)."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def commandcode_provider():
+    """The configured Command Code provider as {"base", "key"}, or None."""
+    try:
+        cfg = json.loads(V2_CONFIG.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    for prov in (cfg.get("provider") or {}).values():
+        opts = prov.get("options") or {}
+        base = opts.get("baseURL") or ""
+        key = opts.get("apiKey") or ""
+        if "commandcode" in base.lower() and key:
+            return {"base": base, "key": key}
+    return None
+
+
+class Unauthorized(Exception):
+    """The API key was rejected (or is missing): there is nothing to display,
+    which is different from a transient failure worth retrying with the previous
+    reading left on screen."""
+
+
+def _cc_get(path, key):
+    req = urllib.request.Request(
+        f"{CC_API}/{path}",
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json",
+                 "User-Agent": CC_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=USAGE_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as err:
+        if err.code in (401, 403):
+            raise Unauthorized(path) from err
+        raise
+
+
+def _iso_epoch(ts):
+    """Epoch seconds for an ISO-8601 timestamp, or None."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def fetch_usage(prov):
+    """Quota meters for a Command Code provider: each window's remaining share and
+    its reset time (the web page shows the used share, so 100 - used/cap is what
+    the overlay wants). None if the account reports no limits or the endpoints are
+    unavailable."""
+    try:
+        credits = _cc_get("billing/credits", prov["key"])
+        summary = _cc_get("usage/summary", prov["key"])
+    except (OSError, ValueError):  # URLError/HTTPError are OSErrors; bad JSON is ValueError
+        return None
+    left, reset = {}, {}
+    for window, label in (("fiveHour", "5h"), ("weekly", "week")):
+        w = (credits.get("windowLimits") or {}).get(window) or {}
+        used, cap = w.get("used"), w.get("cap")
+        if _isnum(used) and _isnum(cap) and cap > 0:
+            left[label] = max(0.0, min(100.0, 100.0 * (1 - used / cap)))
+        if _isnum(w.get("resetAt")):
+            reset[label] = w["resetAt"] / 1000.0
+    cred = credits.get("credits") or {}
+    remaining = 0.0
+    for field in ("monthlyCredits", "purchasedCredits", "freeCredits"):
+        if _isnum(cred.get(field)):
+            remaining += cred[field]
+    # The monthly meter is implied: credits left over spending so far this period.
+    spent = summary.get("totalCost")
+    if remaining > 0 and _isnum(spent) and spent >= 0:
+        left["month"] = max(0.0, min(100.0, 100.0 * remaining / (spent + remaining)))
+    if not left:
+        return None
+    # Period totals for the billing month, same payload as the cost above.
+    runs, tokens = summary.get("totalCount"), summary.get("totalTokens")
+    if "month" in left:
+        # Only the subscription knows when the billing period rolls over; a failure
+        # here costs the monthly reset date, not the meters themselves.
+        try:
+            sub = _cc_get("billing/subscriptions", prov["key"]).get("data") or {}
+            at = _iso_epoch(sub.get("currentPeriodEnd"))
+        except (OSError, ValueError, AttributeError):
+            at = None
+        if at is not None:
+            reset["month"] = at
+    return {"base": prov["base"], "left": left, "reset": reset, "credits": remaining,
+            "runs": runs if _isnum(runs) else None,
+            "tokens": tokens if _isnum(tokens) else None,
+            "ts": time.time()}
+
+
+def poll_usage(store):
+    """Refresh the quota meters slowly. No provider, no key or a rejected key means
+    nothing may be shown at all; only a transient failure keeps the last reading,
+    and even that is dropped once it goes stale."""
+    while True:
+        prov = commandcode_provider()
+        data, drop = None, not prov  # no credential -> nothing to render
+        if prov:
+            try:
+                data = fetch_usage(prov)
+            except Unauthorized:
+                drop = True
+        with store.lock:
+            if data:
+                store.usage = data
+            elif drop:
+                store.usage = None
+            elif store.usage and time.time() - store.usage["ts"] > USAGE_STALE_S:
+                store.usage = None
+        time.sleep(USAGE_POLL_S)
 
 
 def short_base(base):

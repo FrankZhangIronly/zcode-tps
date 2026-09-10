@@ -217,22 +217,31 @@ def tps_session_stats(args):
         return f"No completed requests for session {sid}."
     lines = [f"Session {sid} — last {len(rows)} requests (newest first):"]
     tps_list, ttft_list, total_out = [], [], 0
+    approx_n = 0
     for r in reversed(rows):  # oldest first so the list reads chronologically
         dur, ttft, out = r["duration_ms"], r["time_to_first_token_ms"], r["output_tokens"]
         ttft_s = (ttft / 1000.0) if isinstance(ttft, (int, float)) and isinstance(dur, (int, float)) \
             and 0 <= ttft < dur else None
+        # Without a first-token stamp (tool-call-only responses never get one) the
+        # speed can only be timed end to end, so it is marked and kept out of the
+        # average -- same rule as the overlay's list.
+        approx = ttft_s is None
         tps = None
         if isinstance(out, (int, float)) and out > 0 and isinstance(dur, (int, float)) and dur > 0:
-            span = (dur - ttft) if ttft_s is not None else dur
+            span = dur if approx else (dur - ttft)
             tps = out * 1000.0 / span
         when = time.strftime("%H:%M:%S", time.localtime((r["started_at"] or 0) / 1000.0))
         dur_s = f"{dur / 1000.0:.1f}" if isinstance(dur, (int, float)) else "--"
-        tps_s = f"{tps:.1f}" if tps is not None else "--"
+        tps_s = ("--" if tps is None else
+                 f"~{tps:.1f}" if approx else f"{tps:.1f}")
         tt_s = f"{ttft_s:.1f}s" if ttft_s is not None else "--"
         out_s = f"{int(out)}" if isinstance(out, (int, float)) else "0"
         lines.append(f"  {when}  {r['model_id']}  dur {dur_s}s  {tps_s} tok/s  TTFT {tt_s}  out {out_s}")
         if tps is not None:
-            tps_list.append(tps)
+            if approx:
+                approx_n += 1
+            else:
+                tps_list.append(tps)
         if ttft_s is not None:
             ttft_list.append(ttft_s)
         if isinstance(out, (int, float)):
@@ -242,6 +251,9 @@ def tps_session_stats(args):
         if ttft_list:
             summary += f", avg TTFT {sum(ttft_list) / len(ttft_list):.1f}s"
         summary += f", total output {total_out} tokens"
+        if approx_n:
+            summary += (f" ('~' = end-to-end, no TTFT, excluded from avg:"
+                        f" {approx_n} request(s))")
         lines.append(summary)
     return "\n".join(lines)
 
