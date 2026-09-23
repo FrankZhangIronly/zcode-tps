@@ -31,9 +31,13 @@ TRACK_BG = "#45475a"   # quota bar track
 
 CARET_OPEN, CARET_CLOSED = "▾", "▸"
 SECTIONS = ("avg", "quota", "recent")
-QUOTA_H = 104          # quota canvas height: pill row + card row
 CARD_H = 72            # one quota card
 CPAD, CGAP = 10, 8     # quota canvas outer padding / gap between cards
+QUOTA_NAME_H = 22      # source name row inside the canvas
+QUOTA_PILL_H = 24      # summary pill row
+QUOTA_BLOCK = QUOTA_NAME_H + CARD_H   # one source's block
+QUOTA_GAP = 12         # gap between two sources' blocks
+QUOTA_PAD = 4          # canvas top/bottom padding
 QUOTA_MIN_W = 52       # min separator width (chars) that keeps three cards readable
 BAR_H = 6              # quota bar thickness
 
@@ -47,7 +51,7 @@ I18N = {
         "col_tps": "tok/s", "col_ttft": "TTFT",
         "avg": "avg", "last": "last",
         "approx": "~ = end-to-end, no TTFT (excluded from avg)",
-        "quota_hdr": "Quota · {base}",
+        "quota_hdr": "Quota",
         "q_5h": "5-hour left", "q_week": "Weekly left", "q_month": "Monthly left",
         "reset": "resets in {d}",
         "credits": "${v} credits left",
@@ -62,7 +66,7 @@ I18N = {
         "col_tps": "tok/s", "col_ttft": "TTFT",
         "avg": "均值", "last": "最近",
         "approx": "~ = 含首字等待，未计入均值",
-        "quota_hdr": "剩余额度 · {base}",
+        "quota_hdr": "剩余额度",
         "q_5h": "5 小时剩余", "q_week": "每周剩余", "q_month": "每月剩余",
         "reset": "{d} 后重置",
         "credits": "${v} 可用额度",
@@ -116,38 +120,42 @@ def fmt_count(v):
     return f"{v:,.0f}"
 
 
-def quota_pill(usage, t):
-    """The summary line above the cards: credits left, then the billing-period
-    totals the usage page shows — how much was spent and how many runs it took."""
+def quota_pill(src, t):
+    """The summary line above one source's cards. Command Code reports credits left
+    and the billing-period totals; sources without such figures get no pill."""
     parts = []
-    credit = (usage or {}).get("credits")
+    credit = (src or {}).get("credits")
     if isinstance(credit, (int, float)) and credit > 0:
         parts.append(t["credits"].format(v=f"{credit:.1f}"))
-    tokens = (usage or {}).get("tokens")
+    tokens = (src or {}).get("tokens")
     if isinstance(tokens, (int, float)) and tokens > 0:
         parts.append(f"{fmt_count(tokens)} tokens")
-    runs = (usage or {}).get("runs")
+    runs = (src or {}).get("runs")
     if isinstance(runs, (int, float)) and runs > 0:
         parts.append(f"{runs:,.0f} runs")  # a count reads better with separators
     return "  ·  ".join(parts)
 
 
-def quota_view(width, usage, t):
-    """Pure input for the quota canvas: (signature, pill text, card list).
-    A card is (title, percent text, remaining fraction 0..1, reset text, colour).
-    The countdown is built here from the fetch timestamp, so it ticks down on
-    its own between the 60s refreshes."""
-    left = (usage or {}).get("left") or {}
-    reset = (usage or {}).get("reset") or {}
-    cards = []
-    for key in ("5h", "week", "month"):
-        if key not in left:
-            continue
-        pct = left[key]
-        sub = t["reset"].format(d=short_delta(reset[key] - time.time())) if key in reset else ""
-        cards.append((t[f"q_{key}"], f"{pct:.0f}%", pct / 100.0, sub, level_color(pct)))
-    pill = quota_pill(usage, t)
-    return (width, pill, tuple(cards)), pill, cards
+def quota_view(width, usages, t):
+    """Pure input for the quota canvas: (signature, blocks). One block per account,
+    each (name, pill, cards); a card is (title, percent text, remaining fraction
+    0..1, reset text, colour). Countdowns are built here from each source's own
+    figures, so they tick down between the 60s refreshes."""
+    blocks = []
+    for src in (usages or []):
+        left = src.get("left") or {}
+        reset = src.get("reset") or {}
+        cards = []
+        for key in ("5h", "week", "month"):
+            if key not in left:
+                continue
+            pct = left[key]
+            sub = (t["reset"].format(d=short_delta(reset[key] - time.time()))
+                   if key in reset else "")
+            cards.append((t[f"q_{key}"], f"{pct:.0f}%", pct / 100.0, sub, level_color(pct)))
+        if cards:
+            blocks.append((src.get("name") or "", quota_pill(src, t), tuple(cards)))
+    return (width, tuple(blocks)), blocks
 
 
 def _rrect(canvas, x0, y0, x1, y1, r, **kw):
@@ -158,40 +166,42 @@ def _rrect(canvas, x0, y0, x1, y1, r, **kw):
     return canvas.create_polygon(pts, smooth=True, **kw)
 
 
-def draw_quota(canvas, width, pill, cards, fonts):
-    """Draw the pill + one card per quota window, side by side, filling width."""
-    f_pill, f_title, f_pct, f_sub = fonts
+def draw_quota(canvas, width, blocks, fonts):
+    """Draw every block: its name (and pill, when it has one) over a row of cards,
+    with the canvas sized to hold them all."""
+    f_pill, f_title, f_pct, f_sub, f_name = fonts
     canvas.delete("all")
-    canvas.config(height=QUOTA_H if pill else QUOTA_H - 24)
-    y = 4
-    if pill:
-        cw = f_pill.measure(pill)
-        _rrect(canvas, 0, y, cw + 18, y + 18, 9, fill=HEAD_BG, outline="")
-        canvas.create_text(9, y + 9, text=pill, anchor="w", font=f_pill, fill=FG)
-        y += 24
-    if not cards:
-        return
-    cw = (width - 2 * CPAD - (len(cards) - 1) * CGAP) / len(cards)
-    for i, (title, pct_text, frac, sub, color) in enumerate(cards):
-        x0 = CPAD + i * (cw + CGAP)
-        x1 = x0 + cw
-        _rrect(canvas, x0, y, x1, y + CARD_H, 8, fill=CARD_BG, outline="")
-        canvas.create_text(x0 + 10, y + 7, text=title, anchor="nw", font=f_title, fill=DIM)
-        canvas.create_text(x0 + 10, y + 19, text=pct_text, anchor="nw", font=f_pct, fill=color)
-        # Bars are round-capped lines, not smoothed rectangles: at this thickness a
-        # smoothed polygon's corner radius swallows the bar and bulges it out in the
-        # middle, while a wide line keeps one constant thickness end to end. The caps
-        # reach half a width past each endpoint, so the endpoints are inset to keep
-        # the bar flush with the text above it.
-        bx0, bx1, by = x0 + 10 + BAR_H // 2, x1 - 10 - BAR_H // 2, y + 49
-        canvas.create_line(bx0, by, bx1, by, width=BAR_H, fill=TRACK_BG,
-                           capstyle=tk.ROUND)
-        # zero-length is drawn as a single round dot, so even 0% shows where the
-        # bar starts instead of vanishing
-        filled = max(0.0, (bx1 - bx0) * max(0.0, min(1.0, frac)))
-        canvas.create_line(bx0, by, bx0 + filled, by, width=BAR_H, fill=color,
-                           capstyle=tk.ROUND)
-        canvas.create_text(x0 + 10, y + 57, text=sub, anchor="nw", font=f_sub, fill=DIM)
+    pills = sum(1 for _n, pill, _c in blocks if pill)
+    canvas.config(height=QUOTA_PAD * 2 + len(blocks) * QUOTA_BLOCK
+                  + max(0, len(blocks) - 1) * QUOTA_GAP + pills * QUOTA_PILL_H)
+    y = QUOTA_PAD
+    for name, pill, cards in blocks:
+        if name:
+            canvas.create_text(0, y + 8, text=name, anchor="w", font=f_name, fill=BLUE)
+        y += QUOTA_NAME_H
+        if pill:
+            cw = f_pill.measure(pill)
+            _rrect(canvas, 0, y, cw + 18, y + 18, 9, fill=HEAD_BG, outline="")
+            canvas.create_text(9, y + 9, text=pill, anchor="w", font=f_pill, fill=FG)
+            y += QUOTA_PILL_H
+        if not cards:
+            continue
+        cw = (width - 2 * CPAD - (len(cards) - 1) * CGAP) / len(cards)
+        for i, (title, pct_text, frac, sub, color) in enumerate(cards):
+            x0 = CPAD + i * (cw + CGAP)
+            x1 = x0 + cw
+            _rrect(canvas, x0, y, x1, y + CARD_H, 8, fill=CARD_BG, outline="")
+            canvas.create_text(x0 + 10, y + 7, text=title, anchor="nw", font=f_title, fill=DIM)
+            canvas.create_text(x0 + 10, y + 19, text=pct_text, anchor="nw", font=f_pct,
+                               fill=color)
+            bx0, bx1, by = x0 + 12, x1 - 12, y + 46
+            canvas.create_line(bx0, by, bx1, by, width=BAR_H, fill=TRACK_BG,
+                               capstyle=tk.ROUND)
+            filled = max(0.0, (bx1 - bx0) * max(0.0, min(1.0, frac)))
+            canvas.create_line(bx0, by, bx0 + filled, by, width=BAR_H, fill=color,
+                               capstyle=tk.ROUND)
+            canvas.create_text(x0 + 10, y + 57, text=sub, anchor="nw", font=f_sub, fill=DIM)
+        y += CARD_H + QUOTA_GAP
 
 
 def pick_family(root, *names):
@@ -293,7 +303,8 @@ class Overlay(tk.Tk):
         self.fonts = (tkfont.Font(root=self, family=fam, size=8),    # pill
                       tkfont.Font(root=self, family=fam, size=8),    # card title
                       tkfont.Font(root=self, family=fam, size=15, weight="bold"),
-                      tkfont.Font(root=self, family=fam, size=8))    # reset line
+                      tkfont.Font(root=self, family=fam, size=8),    # reset line
+                      tkfont.Font(root=self, family=fam, size=8))    # source name
         self.head_lbl = tk.Label(self.frame, bg=BG, anchor="w", font=FONT, fg=BLUE)
         self.seps = {k: tk.Label(self.frame, bg=BG, anchor="w", font=FONT, fg=DIM)
                      for k in SECTIONS}
@@ -307,7 +318,8 @@ class Overlay(tk.Tk):
             body.pack(fill="x")
             self.sections[key] = (sec, head, body)
             if key == "quota":
-                self.quota_canvas = tk.Canvas(body, bg=BG, width=1, height=QUOTA_H,
+                self.quota_canvas = tk.Canvas(body, bg=BG, width=1,
+                                              height=QUOTA_BLOCK + QUOTA_PAD * 2,
                                               highlightthickness=0, bd=0)
                 self.quota_canvas.pack(fill="x")
                 self.quota_canvas.bind("<Configure>", self._on_quota_configure)
@@ -537,7 +549,7 @@ class Overlay(tk.Tk):
         with self.store.lock:
             history = {k: list(v) for k, v in self.store.history.items()}
             model_last = dict(self.store.model_last)
-            usage = self.store.usage
+            usages = list(self.store.usages or [])
             for rec in self.store.records:  # close records stuck past TTL (e.g. killed)
                 if rec["end"] is None and now - rec["start"] > ACTIVE_TTL:
                     rec["end"] = now
@@ -545,9 +557,7 @@ class Overlay(tk.Tk):
             records = [dict(r) for r in self.store.records]
         records.sort(key=lambda r: r["start"])
 
-        # Which base the quota cards belong to: the account is per provider, so
-        # only the base it was fetched for may show them.
-        qbase = usage.get("base") if usage else None
+        has_quota = bool(usages)
         avg_lines, recent_lines = [], []
         if history:
             base_models = {}
@@ -604,25 +614,24 @@ class Overlay(tk.Tk):
         # width; the quota cards need a floor of their own to stay side by side.
         content = avg_lines + recent_lines
         max_w = max([disp_w(t) for t, _ in content] or [40])
-        if qbase:
-            # The cards need a width floor of their own; that same floor (52 chars,
-            # ~364px) also clears the widest possible pill (~292px), so the summary
-            # line above them never clips.
+        if has_quota:
+            # 52 chars (~364px) keeps three cards readable and also clears the
+            # widest possible pill (~292px), so the summary line never clips.
             max_w = max(max_w, QUOTA_MIN_W - 2)
         sep = "─" * (max_w + 2)
 
         sections = {"avg": avg_lines, "recent": recent_lines}
-        sig = (bool(qbase), tuple(sorted(self.collapsed)))
+        sig = (has_quota, tuple(sorted(self.collapsed)))
         if sig != self._layout_sig:
             self._layout_sig = sig
-            self._apply_layout(bool(qbase))
+            self._apply_layout(has_quota)
         # No caret on the title: it is not collapsible, and a caret would imply it is
         self.head_lbl.config(text=f"⚡ ZCode TPS  {time.strftime('%H:%M:%S')}")
         for key in SECTIONS:
             if key == "quota":
-                if not qbase:  # hidden with no quota data; nothing to title
+                if not has_quota:  # hidden with no quota data; nothing to title
                     continue
-                title = T["quota_hdr"].format(base=short_base(qbase))
+                title = T["quota_hdr"]
             else:
                 title = T["avg_hdr"] if key == "avg" else T["recent"].format(n=len(records))
             self.sections[key][1].config(
@@ -632,12 +641,12 @@ class Overlay(tk.Tk):
             self.stacks[key].render(sections[key])
         # The cards are sized from the real canvas width, so a window resize
         # (which resets the signature via <Configure>) re-lays them out.
-        width = self.quota_canvas.winfo_width() if qbase else 0
+        width = self.quota_canvas.winfo_width() if has_quota else 0
         if width > 1:
-            qsig, pill, cards = quota_view(width, usage, T)
+            qsig, blocks = quota_view(width, usages, T)
             if qsig != self._quota_sig:
                 self._quota_sig = qsig
-                draw_quota(self.quota_canvas, width, pill, cards, self.fonts)
+                draw_quota(self.quota_canvas, width, blocks, self.fonts)
 
 
 def main():

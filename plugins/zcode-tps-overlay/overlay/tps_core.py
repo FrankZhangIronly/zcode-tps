@@ -6,6 +6,8 @@ Data sources:
   time_to_first_token_ms (TTFT); read via read-only WAL, safe while zcode runs
 - api.commandcode.ai/alpha (undocumented; the same read-only GETs the official
   CLI and web app use) — Command Code 5h/week/month quota meters
+- opencode.ai/api/orgs/<org>/go/status (undocumented) — OpenCode Go rolling /
+  weekly / monthly usage; opt-in, needs a key in ~/.zcode/tps.json
 
 Stdlib only.
 """
@@ -36,9 +38,12 @@ ACTIVE_TTL = 15 * 60   # record timeout (crash-leftover guard)
 PAIR_TOL = 5  # s; a started event pairs with a model_usage row within this start-time tolerance
 
 CC_API = "https://api.commandcode.ai/alpha"  # Command Code quota meters (read-only)
-CC_USER_AGENT = "zcode-tps-overlay"  # Cloudflare error 1010 rejects Python's default UA
+OC_API = "https://opencode.ai/api"  # OpenCode Go usage (console API, undocumented)
+OPENCODE_NAME = "OpenCode Go"  # product name, not translated
+SOURCE_ORDER = ("commandcode", "opencode")  # display order of the quota sections
+USER_AGENT = "zcode-tps-overlay"  # Cloudflare error 1010 rejects Python's default UA
 USAGE_POLL_S = 60      # quota refresh interval
-USAGE_STALE_S = 300    # drop the meters once refreshing has failed this long
+USAGE_STALE_S = 300    # drop a source once refreshing it has failed this long
 USAGE_TIMEOUT = 8      # s per request
 
 DEFAULT_CONFIG = {"language": "en", "autostart": True}
@@ -140,7 +145,7 @@ class Store:
         self.history = {}        # (baseURL, modelId) -> deque(maxlen=10) of (tok/s, TTFT s|None)
         self.model_last = {}     # (baseURL, modelId) -> start epoch of its latest request
         self.provider_base = {}  # providerId -> baseURL (from v2/config.json, refreshed on demand)
-        self.usage = None        # Command Code quota meters (see poll_usage)
+        self.usages = None       # quota sources, one per account (see poll_usage)
         self._cfg_mtime = 0.0
 
     def base_of(self, provider_id):
@@ -345,6 +350,27 @@ def _isnum(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def _num(v):
+    """v as a float; numeric strings count too, because the OpenCode API sends
+    micro-amounts as strings (they are BigInt on the server)."""
+    if _isnum(v):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _when(v):
+    """Epoch seconds from an ISO-8601 string or an epoch number (s or ms)."""
+    at = _iso_epoch(v) if isinstance(v, str) else None
+    if at is None and _isnum(v):
+        at = v / 1000.0 if v > 1e11 else float(v)
+    return at
+
+
 def commandcode_provider():
     """The configured Command Code provider as {"base", "key"}, or None."""
     try:
@@ -360,24 +386,44 @@ def commandcode_provider():
     return None
 
 
+def opencode_account(cfg):
+    """OpenCode Go credentials from tps.json as {"key", "org", "base"}, or None.
+
+    Opt-in on purpose: OpenCode is not a zcode provider, so its key cannot be read
+    from zcode's own config. Until one is configured, nothing here is ever called
+    and no request is made."""
+    oc = (cfg or {}).get("opencode") or {}
+    key = str(oc.get("api_key") or "").strip()
+    if not key:
+        return None
+    return {"key": key,
+            "org": str(oc.get("org_id") or "").strip(),
+            "base": str(oc.get("api_base") or OC_API).rstrip("/")}
+
+
 class Unauthorized(Exception):
     """The API key was rejected (or is missing): there is nothing to display,
     which is different from a transient failure worth retrying with the previous
     reading left on screen."""
 
 
-def _cc_get(path, key):
-    req = urllib.request.Request(
-        f"{CC_API}/{path}",
-        headers={"Authorization": f"Bearer {key}", "Accept": "application/json",
-                 "User-Agent": CC_USER_AGENT})
+def _get_json(url, key, extra_headers=None):
+    headers = {"Authorization": f"Bearer {key}", "Accept": "application/json",
+               "User-Agent": USER_AGENT}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=USAGE_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as err:
         if err.code in (401, 403):
-            raise Unauthorized(path) from err
+            raise Unauthorized(url) from err
         raise
+
+
+def _cc_get(path, key):
+    return _get_json(f"{CC_API}/{path}", key)
 
 
 def _iso_epoch(ts):
@@ -390,15 +436,16 @@ def _iso_epoch(ts):
         return None
 
 
-def fetch_usage(prov):
-    """Quota meters for a Command Code provider: each window's remaining share and
-    its reset time (the web page shows the used share, so 100 - used/cap is what
-    the overlay wants). None if the account reports no limits or the endpoints are
-    unavailable."""
+def fetch_commandcode(prov):
+    """Command Code meters as a quota source, or None. Each window's remaining
+    share and reset time (the web page shows the used share, so 100 - used/cap is
+    what the overlay wants)."""
     try:
         credits = _cc_get("billing/credits", prov["key"])
         summary = _cc_get("usage/summary", prov["key"])
     except (OSError, ValueError):  # URLError/HTTPError are OSErrors; bad JSON is ValueError
+        return None
+    if not isinstance(credits, dict) or not isinstance(summary, dict):
         return None
     left, reset = {}, {}
     for window, label in (("fiveHour", "5h"), ("weekly", "week")):
@@ -431,31 +478,87 @@ def fetch_usage(prov):
             at = None
         if at is not None:
             reset["month"] = at
-    return {"base": prov["base"], "left": left, "reset": reset, "credits": remaining,
+    return {"id": "commandcode", "name": short_base(prov["base"]),
+            "left": left, "reset": reset, "credits": remaining,
             "runs": runs if _isnum(runs) else None,
             "tokens": tokens if _isnum(tokens) else None,
             "ts": time.time()}
 
 
+def fetch_opencode(acct):
+    """OpenCode Go meters as a quota source, or None.
+
+    The console's own client (api.opencode.ai, route /orgs/:orgId/go/status) answers
+    with meters.{fiveHour,week,month}, each holding usedMicroCents/limitMicroCents;
+    the monthly window takes its reset from the paid period's endsAt. Both the route
+    and the credential scheme are undocumented, so every field is treated as
+    optional and any surprise leaves the section hidden rather than wrong."""
+    path = f"/orgs/{acct['org']}/go/status" if acct["org"] else "/go/status"
+    try:
+        # x-api-key as well as the bearer header: the API spec declares both schemes
+        # and which one a key is issued for cannot be checked from here.
+        data = _get_json(acct["base"] + path, acct["key"], {"x-api-key": acct["key"]})
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    meters = data.get("meters")
+    if not isinstance(meters, dict):
+        return None
+    left, reset = {}, {}
+    for key, label in (("fiveHour", "5h"), ("week", "week"), ("month", "month")):
+        m = meters.get(key)
+        if not isinstance(m, dict):
+            continue
+        used, limit = _num(m.get("usedMicroCents")), _num(m.get("limitMicroCents"))
+        if limit > 0:
+            left[label] = max(0.0, min(100.0, 100.0 * (1 - used / limit)))
+        at = _when(m.get("resetsAt"))
+        if at is not None:
+            reset[label] = at
+    at = _when(data.get("endsAt"))  # monthly rolls over with the paid period
+    if at is not None and "month" in left:
+        reset["month"] = at
+    if not left:
+        return None
+    return {"id": "opencode", "name": OPENCODE_NAME, "left": left, "reset": reset,
+            "ts": time.time()}
+
+
 def poll_usage(store):
-    """Refresh the quota meters slowly. No provider, no key or a rejected key means
-    nothing may be shown at all; only a transient failure keeps the last reading,
-    and even that is dropped once it goes stale."""
+    """Refresh every configured quota source. A source with no credential is simply
+    absent; a rejected key drops that source at once; only a transient failure keeps
+    its previous reading, and even that is dropped once it goes stale."""
     while True:
+        fresh, reject = {}, set()
         prov = commandcode_provider()
-        data, drop = None, not prov  # no credential -> nothing to render
         if prov:
             try:
-                data = fetch_usage(prov)
+                src = fetch_commandcode(prov)
             except Unauthorized:
-                drop = True
+                reject.add("commandcode")
+            else:
+                if src:
+                    fresh[src["id"]] = src
+        acct = opencode_account(load_config())
+        if acct:
+            try:
+                src = fetch_opencode(acct)
+            except Unauthorized:
+                reject.add("opencode")
+            else:
+                if src:
+                    fresh[src["id"]] = src
         with store.lock:
-            if data:
-                store.usage = data
-            elif drop:
-                store.usage = None
-            elif store.usage and time.time() - store.usage["ts"] > USAGE_STALE_S:
-                store.usage = None
+            prev = {s["id"]: s for s in (store.usages or [])}
+            now = time.time()
+            kept = [s for sid, s in prev.items()
+                    if sid not in fresh and sid not in reject
+                    and now - s["ts"] <= USAGE_STALE_S]
+            live = list(fresh.values()) + kept
+            live.sort(key=lambda s: SOURCE_ORDER.index(s["id"])
+                      if s["id"] in SOURCE_ORDER else len(SOURCE_ORDER))
+            store.usages = live or None
         time.sleep(USAGE_POLL_S)
 
 
